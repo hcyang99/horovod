@@ -29,6 +29,8 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <iostream>
+#include <string>
 
 #include "common.h"
 #include "fusion_buffer_manager.h"
@@ -76,6 +78,8 @@
 #if HAVE_GLOO
 #include "gloo/gloo_controller.h"
 #include "ops/gloo_operations.h"
+const std::string GLOO_NIC_0 = "enp1s0";
+const std::string GLOO_NIC_1 = "enp6s0";
 #endif
 
 /*
@@ -183,6 +187,11 @@ OperationManager* CreateOperationManager(HorovodGlobalState& state) {
 #if HAVE_NCCL && HOROVOD_GPU_BROADCAST == 'N'
     broadcast_ops.push_back(
         std::shared_ptr<BroadcastOp>(new NCCLBroadcast(&nccl_context, &gpu_context, &state)));
+#endif
+
+#if HAVE_NCCL && HOROVOD_GPU_ALLGATHER == 'N'
+  allgather_ops.push_back(std::shared_ptr<AllgatherOp>(
+      new NCCLAllgather(&nccl_context, &gpu_context, &state)));
 #endif
 
 #if HAVE_GLOO
@@ -370,10 +379,10 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
     else
 #endif
     {
-      gloo_context.Initialize(ParseGlooIface());
+      // gloo_context.Initialize(ParseGlooIface());
+      gloo_context.Initialize(GLOO_NIC_0);
     }
 #endif
-
   // Initialize controller
   state.controller->Initialize();
 
@@ -506,8 +515,11 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   LOG(INFO, horovod_global.controller->GetRank()) << "Horovod Initialized";
 
   // Iterate until shutdown.
-  while (RunLoopOnce(state))
-    ;
+  try {
+    while (RunLoopOnce(state));
+  } catch (const std::exception& ex) {
+    LOG(ERROR) << "Horovod background loop uncaught exception: " << ex.what();
+  }
 
     // Finalize all contexts
 #if HAVE_NCCL
@@ -575,12 +587,32 @@ bool RunLoopOnce(HorovodGlobalState& state) {
         response_list, tensor_names);
   }
 
+  #ifdef HAVE_GLOO
+  static size_t run_cnt = 1;
+  static std::string curr_nic = GLOO_NIC_0;
+  if (response_list.responses().size())
+  {
+    if (run_cnt % 10 == 0)
+    {
+      std::cout << "Changing iface from " << curr_nic << " at run " << run_cnt << "\n";
+      if (curr_nic == GLOO_NIC_0)
+        curr_nic = GLOO_NIC_1;
+      else 
+        curr_nic = GLOO_NIC_0;
+      
+      gloo_context.Finalize();
+      gloo_context.Initialize(curr_nic);
+    }
+  }
+  #endif
+  
+
   // Perform the collective operation. All nodes should end up performing
   // the same operation.
   int rank = state.controller->GetRank();
   for (auto& response : response_list.responses()) {
     LOG(TRACE, rank) << "Performing " << response.tensor_names_string();
-    LOG(DEBUG, rank) << "Processing " << response.tensor_names().size()
+    LOG(TRACE, rank) << "Processing " << response.tensor_names().size()
                      << " tensors";
     PerformOperation(response, horovod_global);
     LOG(TRACE, rank) << "Finished performing "
